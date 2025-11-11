@@ -1,0 +1,239 @@
+sh-5.2$ cat main.tf
+# main.tf
+
+# ============================================
+# Local Variables
+# ============================================
+locals {
+  # Add GitHub token to URL if provided
+  bitbucket_url = var.Userdata_token != "" ? replace(var.bitbucket_repo_url, "https://", "https://${var.Userdata_token}@") : var.bitbucket_repo_url
+}
+
+# ============================================
+# EC2 Instance
+# ============================================
+resource "aws_instance" "windows_ansible" {
+  ami                    = var.windows_ami_id
+  instance_type          = var.instance_type
+  subnet_id              = var.subnet_id
+  vpc_security_group_ids = var.security_group_ids
+  key_name               = var.key_name
+
+  # UserData script
+  user_data = templatefile("${path.module}/windows-userdata.ps1", {
+    bitbucket_repo_url = local.bitbucket_url
+  })
+
+  # Root volume configuration
+  root_block_device {
+    volume_size           = var.root_volume_size
+    volume_type           = var.root_volume_type
+    delete_on_termination = true
+    encrypted             = false
+  }
+
+  # Tags
+  tags = {
+    Name      = var.instance_name
+    OS        = "Windows"
+    Purpose   = "Ansible Server"
+    ManagedBy = "OpenTofu"
+  }
+
+  # IMDSv2
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+}
+
+
+sh-5.2$ cat terraform.tfvars
+# terraform.tfvars
+
+aws_region = "us-west-2"
+
+# Windows Server 2022 AMI (update with your AMI ID)
+windows_ami_id = "ami-06e75c920b3472f6f"  # Replace with actual Windows AMI
+
+# Instance configuration
+instance_type = "t3.micro"  # Windows needs more resources
+instance_name = "windows-ansible-server"
+
+# Network configuration
+subnet_id          = "subnet-028ab4d9054726ec3"  # Your subnet
+security_group_ids = ["sg-0cc22f363e66bfc47"]    # Your security group
+
+# Key pair
+key_name = "dre"
+
+# bitbucket repository (update with your repo)
+bitbucket_repo_url = "https://emilechindo@bitbucket.org/iherbllc/dba.ansible.git"
+
+# bitbucket token for private repos (optional)
+Userdata_token = ""
+sh-5.2$
+
+sh-5.2$ cat varriables.tf
+# variables.tf
+
+# ============================================
+# AWS Configuration
+# ============================================
+variable "aws_region" {
+  description = "AWS region where resources will be created"
+  type        = string
+  default     = "us-east-2"
+}
+
+# ============================================
+# EC2 Instance Configuration
+# ============================================
+variable "windows_ami_id" {
+  description = "AMI ID for Windows Server"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t3.xlarge"
+}
+
+variable "instance_name" {
+  description = "Name tag for the instance"
+  type        = string
+  default     = "windows-ansible-server"
+}
+
+# ============================================
+# Network Configuration
+# ============================================
+variable "subnet_id" {
+  description = "Subnet ID where instance will be launched"
+  type        = string
+}
+
+variable "security_group_ids" {
+  description = "List of security group IDs"
+  type        = list(string)
+}
+
+# ============================================
+# Key Pair Configuration
+# ============================================
+variable "key_name" {
+  description = "EC2 key pair name"
+  type        = string
+}
+
+# ============================================
+# Storage Configuration
+# ============================================
+variable "root_volume_size" {
+  description = "Size of root volume in GB"
+  type        = number
+  default     = 31
+}
+
+variable "root_volume_type" {
+  description = "Type of root volume"
+  type        = string
+  default     = "gp3"
+}
+
+# ============================================
+# GitHub Repository Configuration
+# ============================================
+variable "bitbucket_repo_url" {
+  description = "bitbucket repository URL"
+  type        = string
+  default     = "https://emilechindo@bitbucket.org/iherbllc/dba.ansible.git"
+}
+
+variable "Userdata_token" {
+  description = "Bitbucket token for private repos (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+sh-5.2$
+
+
+sh-5.2$ cat windows-userdata.ps1
+<powershell>
+#  UserData
+$ErrorActionPreference = "Continue"
+$Log = "C:\UserData-Log.txt"
+Start-Transcript $Log
+
+# Install Chocolatey
+Set-ExecutionPolicy Bypass -Scope Process -Force
+[System.Net.ServicePointManager]::SecurityProtocol = 3072
+iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+Start-Sleep 10
+
+# Refresh environment
+$env:ChocolateyInstall = Convert-Path "$((Get-Command choco).Path)\..\.."
+Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+refreshenv
+
+# Install software
+choco install git python -y --no-progress
+Start-Sleep 30
+
+# Refresh PATH
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
+# Add Python paths
+$PythonPaths = @("C:\Python312","C:\Python311","C:\Python310")
+foreach ($p in $PythonPaths) {
+    if (Test-Path "$p\python.exe") {
+        $env:Path += ";$p;$p\Scripts"
+        break
+    }
+}
+
+# Install Ansible
+python -m pip install --upgrade pip --quiet
+pip install ansible pywinrm boto3 --quiet
+
+# Configure Git
+git config --global user.name "emilechindo"
+git config --global user.email "emile.chindo@iherb.com"
+
+# Clone repo
+New-Item C:\Ansible -ItemType Directory -Force | Out-Null
+cd C:\Ansible
+git clone "${bitbucket_repo_url}"
+
+# Create and run playbook
+cd dba.ansible -ErrorAction SilentlyContinue
+if (-not (Test-Path "test-playbook.yml")) {
+@"
+---
+- name: Test Ansible
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  tasks:
+    - debug: msg="Ansible {{ ansible_version.full }} works!"
+    - win_command: git --version
+      register: git
+      changed_when: false
+    - debug: var=git.stdout
+    - win_copy:
+        content: "Success at {{ ansible_date_time.iso8601 }}"
+        dest: C:\Ansible-Success.txt
+    - debug: msg="All tests passed!"
+"@ | Out-File test-playbook.yml -Encoding UTF8
+}
+
+ansible-playbook test-playbook.yml -v
+
+"Completed $(Get-Date)" | Out-File C:\UserData-Done.txt
+Stop-Transcript
+</powershell>i
+sh-5.2$
+
